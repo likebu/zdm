@@ -1,4 +1,13 @@
 name: zdm_crawler
+
+on:
+  #将下面两行代码取消注释
+  schedule:
+    - cron: "0/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  build:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
@@ -34,9 +43,9 @@ name: zdm_crawler
         # 优惠信息数量>MIN_PUSH_SIZE就会发邮件,否则积累到下一次触发任务再决定是否推送. 不建议填太小的数字,避免邮件太多了
         MIN_PUSH_SIZE: 10
         # 邮箱的smtp服务器地址(示例给出的是qq邮箱的配置,非qq邮箱需要进行修改)
-        emailHost: smtp.163.com
+        emailHost: smtp.qq.com
         # 邮箱smtp服务端口
-        emailPort: 25
+        emailPort: 465
         # 接收优惠信息的邮箱 为空代表不进行邮箱推送
         emailAccount: ${{secrets.emailAccount}}
         # 接收优惠信息的邮箱的授权码 为空代表不进行邮箱推送
