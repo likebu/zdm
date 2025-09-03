@@ -1,9 +1,13 @@
 package lx;
 
+import cn.hutool.core.collection.CollectionUtil;
 import cn.hutool.core.io.IORuntimeException;
+import cn.hutool.core.thread.ThreadUtil;
 import cn.hutool.http.ContentType;
 import cn.hutool.http.HttpException;
+import cn.hutool.http.HttpRequest;
 import cn.hutool.http.HttpUtil;
+import com.alibaba.fastjson.JSONException;
 import com.alibaba.fastjson.JSONObject;
 import com.google.common.collect.Lists;
 import lx.mapper.ZdmMapper;
@@ -11,15 +15,23 @@ import lx.model.Zdm;
 import lx.utils.StreamUtils;
 import lx.utils.Utils;
 import org.apache.commons.lang3.StringUtils;
+import org.openqa.selenium.Cookie;
+import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.chrome.ChromeDriver;
+import org.openqa.selenium.chrome.ChromeOptions;
 
 import javax.mail.*;
 import javax.mail.internet.InternetAddress;
 import javax.mail.internet.MimeMessage;
+import java.net.HttpCookie;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -28,12 +40,16 @@ import static lx.utils.Const.ZDM_URL;
 
 public class ZdmCrawler {
 
+    private static Collection<HttpCookie> cookies = new ArrayList<>();
+    private static Date expiredDate = null;
+    private static WebDriver driver = null;
+
     public static void main(String[] args) {
-        //突然发现定环境变量名的时候一下子大写下划线,一下子小写驼峰. 考虑到之前已经有在用的用户了, 暂时不做修改了
+        //突然发现定环境变量名的时候一下子大写下划线,一下子小写驼峰. 考虑到之前已经有在用的用户了, 暂时不做修改
         Map<String, String> envMap = System.getenv();
         String emailHost = System.getenv("emailHost"), emailAccount = System.getenv("emailAccount"),
                 emailPassword = System.getenv("emailPassword"), emailPort = envMap.getOrDefault("emailPort", "465"),
-                spt = System.getenv("spt");
+                spt = System.getenv("spt"), cookie = System.getenv("cookie");
         int maxPageSize = Integer.parseInt(envMap.getOrDefault("maxPageSize", "20")),
                 minVoted = Integer.parseInt(envMap.getOrDefault("minVoted", "0")),
                 minComments = Integer.parseInt(envMap.getOrDefault("minComments", "0")),
@@ -41,10 +57,11 @@ public class ZdmCrawler {
         boolean detail = "true".equals(envMap.getOrDefault("detail", "false"));
 
         //获取待推送的优惠信息
-        Collection<Zdm> zdms = obtainUnpushedArticles(maxPageSize);
+        Collection<Zdm> zdms = obtainUnpushedArticles(maxPageSize, cookie);
 
         //根据各项规则执行过滤逻辑
         zdms = processFilter(zdms, minVoted, minComments, detail);
+        System.out.println("过滤后剩余数据条数" + zdms.size());
 
         //在推送之前先入库数据,pushed字段默认为0(未推送)
         ZdmMapper.saveOrUpdateBatch(zdms);
@@ -70,7 +87,7 @@ public class ZdmCrawler {
         });
     }
 
-    private static Collection<Zdm> obtainUnpushedArticles(int maxPageSize) {
+    private static Collection<Zdm> obtainUnpushedArticles(int maxPageSize, String cookie) {
         //GitHub Actions部署的服务器一般在海外,调整为东八区的时区
         ZoneId zoneId = ZoneId.of("GMT+8");
         TimeZone.setDefault(TimeZone.getTimeZone(zoneId));
@@ -82,32 +99,58 @@ public class ZdmCrawler {
         Stream<Zdm> crawled = ZDM_URL.stream().flatMap(url -> {
             List<Zdm> zdmPage = new ArrayList<>();
             for (int i = 1; i <= maxPageSize; i++) {
-                try {
-                    String s = HttpUtil.get(url + i, 10000);
-                    List<Zdm> zdmPart = JSONObject.parseArray(s, Zdm.class);
-                    zdmPart.forEach(zdm -> {
-                        //评论和点值数量的值后面会跟着'k','w'这种字符,将它们转换一下方便后面过滤和排序
-                        zdm.setComments(Utils.strNumberFormat(zdm.getComments()));
-                        zdm.setVoted(Utils.strNumberFormat(zdm.getVoted()));
+                List<Zdm> zdmPart = processCrawl(url + i, cookie, 3);
+                zdmPart.forEach(zdm -> {
+                    //评论和点值数量的值后面会跟着'k','w'这种字符,将它们转换一下方便后面过滤和排序
+                    zdm.setComments(Utils.strNumberFormat(zdm.getComments()));
+                    zdm.setVoted(Utils.strNumberFormat(zdm.getVoted()));
 
-                        //转化为毫秒级时间戳
-                        String timestampStr = zdm.getTimesort() + "000";
-                        zdm.setArticle_time(Instant.ofEpochMilli(Long.parseLong(timestampStr))
-                                .atZone(zoneId)
-                                .toLocalDateTime().toString());
-                    });
-                    zdmPage.addAll(zdmPart);
-                } catch (IORuntimeException | HttpException e) {
-                    //暂时的网络不通,会导致连接超时的异常,等待下次运行即可
-                    System.out.println("pageNumber:" + i + ", connect to zdm server timeout:" + e.getMessage());
-                }
+                    //转化为毫秒级时间戳
+                    String timestampStr = zdm.getTimesort() + "000";
+                    zdm.setArticle_time(Instant.ofEpochMilli(Long.parseLong(timestampStr))
+                            .atZone(zoneId)
+                            .toLocalDateTime().toString());
+                });
+                zdmPage.addAll(zdmPart);
+
+                System.out.println("第" + i + "页数据获取成功, 当前页数据条数" + zdmPart.size());
+                //翻页的间隔时间(毫秒)
+                ThreadUtil.sleep(ThreadLocalRandom.current().nextInt(100, 1001));
             }
             return zdmPage.stream();
         });
 
         return Stream.concat(crawled, unPush.stream())  //两个stream合并,一起参与排序和去重操作
-                .sorted(Comparator.comparing(Zdm::getComments).reversed())    //评论数量倒序,用LinkedHashSet保证有序
+                .sorted(Comparator.comparing(Zdm::getComments, Comparator.comparingInt(Integer::parseInt)).reversed())    //评论数量倒序,用LinkedHashSet保证有序
                 .collect(Collectors.toCollection(LinkedHashSet::new));
+    }
+
+    private static List<Zdm> processCrawl(String url, String cookie, int retry) {
+        /**
+         * 什么值得买的cookie在未登录的状态下是由'__ckguid','x-waf-captcha-referer','w_tsfp'三段组成的
+         * __ckguid是响应头的set-cookie里取下来的, x-waf-captcha-referer固定为空, w_tsfp是靠访问probe.js动态生成
+         * 这里支持从selenium模拟浏览器行为自动获取cookie,也支持在环境变量里自定义固定的cookie值
+         */
+        try {
+            HttpRequest request = HttpUtil.createGet(url).contentType(ContentType.JSON.getValue());
+            if (StringUtils.isNotBlank(cookie))
+                request.header("cookie", cookie);
+            else
+                request.cookie(buildCookies());
+
+            String s = request.execute().body();
+            return JSONObject.parseArray(s, Zdm.class);
+        } catch (IORuntimeException | HttpException | JSONException | java.util.concurrent.TimeoutException |
+                 org.openqa.selenium.TimeoutException e) {
+            //尝试重新获取cookie并重试接口, 重试次数耗尽则结束任务
+            if (retry > 0) {
+                System.out.println("接口调用失败,进行重试");
+                clearCookie();
+                return processCrawl(url, cookie, retry - 1);
+            }
+            e.printStackTrace();
+            throw new RuntimeException("接口调用失败,程序终止");
+        }
     }
 
     private static List<Zdm> processFilter(Collection<Zdm> zdms, int minVoted, int minComments, boolean detail) {
@@ -209,4 +252,49 @@ public class ZdmCrawler {
             throw new RuntimeException("WxPusher推送失败:" + jsonObject.getString("msg"));
         return true;
     }
+
+    private static Collection<HttpCookie> buildCookies() throws TimeoutException {
+        if (driver == null) {
+            /**
+             * GitActions运行时, 已通过工作流配置好了ChromeDriver的路径
+             * 非GitActions运行时, 需要增加这段代码 System.setProperty("webdriver.chrome.driver", "xxxxxxx\\chromedriver.exe");
+             */
+            ChromeOptions options = new ChromeOptions();
+            options.addArguments("--headless");          // 无头模式
+            options.addArguments("--disable-gpu");      // 禁用 GPU 加速（Linux 必备）
+            options.addArguments("--no-sandbox");       // 禁用沙盒（CI 环境必备）
+            options.addArguments("--disable-dev-shm-usage"); // 避免 /dev/shm 不足
+            options.setPageLoadTimeout(Duration.ofSeconds(60));
+            driver = new ChromeDriver(options);
+        }
+
+        //判断cookie即将过期时进行重新获取
+        Date date = Date.from(Instant.now().minusSeconds(30));
+        if (expiredDate != null && expiredDate.before(date)) {
+            clearCookie();
+            return buildCookies();
+        }
+
+        if (!CollectionUtil.isEmpty(cookies))
+            return cookies;
+
+        driver.get("https://faxian.smzdm.com/json_more");
+        cookies = new ArrayList<>();
+        cookies.add(new HttpCookie("x-waf-captcha-referer", ""));
+        Cookie ckguid = driver.manage().getCookieNamed("__ckguid");
+        if (ckguid != null)
+            cookies.add(new HttpCookie("__ckguid", ckguid.getValue()));
+        Cookie w_tsfp = driver.manage().getCookieNamed("w_tsfp");
+        if (w_tsfp != null) {
+            cookies.add(new HttpCookie("w_tsfp", w_tsfp.getValue()));
+            expiredDate = w_tsfp.getExpiry();
+        }
+        return cookies;
+    }
+
+    private static void clearCookie() {
+        cookies = null;
+        expiredDate = null;
+    }
+
 }
